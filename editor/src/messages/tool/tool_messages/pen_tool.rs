@@ -171,6 +171,7 @@ impl<'a> MessageHandler<ToolMessage, &mut ToolActionHandlerData<'a>> for PenTool
 				Abort,
 			),
 			PenToolFsmState::DraggingHandle | PenToolFsmState::PlacingAnchor => actions!(PenToolMessageDiscriminant;
+				Undo,
 				DragStart,
 				DragStop,
 				PointerMove,
@@ -532,7 +533,59 @@ impl PenToolData {
 			modification: VectorDataModification::SetManipulatorPosition { point, position },
 		});
 
-		Some(DocumentMessage::CommitTransaction)
+		Some(DocumentMessage::AbortTransaction)
+	}
+
+	fn undo(&mut self, fsm: PenToolFsmState, document: &DocumentMessageHandler, responses: &mut VecDeque<Message>) -> Option<PenToolFsmState> {
+		// Get subpath
+		let layer_path = self.path.as_ref()?;
+		let subpath = &get_subpaths(LayerNodeIdentifier::from_path(layer_path, document.network()), &document.document_legacy)?[self.subpath_index];
+
+		// Abort if only one manipulator group has been placed
+		if fsm == PenToolFsmState::PlacingAnchor && subpath.len() < 3 {
+			return None;
+		}
+
+		// Get the last manipulator group and the one previous to that
+		let mut manipulator_groups = subpath.manipulator_groups().iter();
+		let mut last_manipulator_group = if self.from_start { manipulator_groups.next()? } else { manipulator_groups.next_back()? };
+		let previous_manipulator_group = if self.from_start { manipulator_groups.next() } else { manipulator_groups.next_back() };
+
+		// Get correct handle types
+		let outwards_handle = if self.from_start { SelectedType::InHandle } else { SelectedType::OutHandle };
+
+		// If placing anchor we should abort if there are less than three manipulators (as the last one gets deleted)
+		let Some(previous_manipulator_group) = previous_manipulator_group else {
+			return None;
+		};
+
+		// Remove the unplaced anchor if in anchor placing mode
+		if fsm == PenToolFsmState::PlacingAnchor {
+			let layer_path = layer_path.clone();
+			responses.add(GraphOperationMessage::Vector {
+				layer: layer_path.to_vec(),
+				modification: VectorDataModification::RemoveManipulatorGroup { id: last_manipulator_group.id },
+			});
+			last_manipulator_group = previous_manipulator_group;
+		}
+
+		None
+	}
+	fn undo_transaction(&mut self, fsm: PenToolFsmState, document: &DocumentMessageHandler, responses: &mut VecDeque<Message>) -> Option<PenToolFsmState> {
+		// Get subpath
+		let layer_path = self.path.as_ref()?;
+		let subpath = &get_subpaths(LayerNodeIdentifier::from_path(layer_path, document.network()), &document.document_legacy)?[self.subpath_index];
+
+		if fsm == PenToolFsmState::PlacingAnchor {
+			responses.add(ToolMessage::ActivateTool { tool_type: ToolType::Pen });
+			if subpath.len() < 3 {
+				return None;
+			}
+		}
+
+		// Abort if only one manipulator group has been placed
+
+		Some(PenToolFsmState::PlacingAnchor)
 	}
 }
 
@@ -631,12 +684,15 @@ impl Fsm for PenToolFsmState {
 				PenToolFsmState::DraggingHandle
 			}
 			(PenToolFsmState::PlacingAnchor, PenToolMessage::DragStart) => {
+				responses.add(DocumentMessage::StartTransaction);
 				tool_data.check_break(document, transform, responses);
 				PenToolFsmState::DraggingHandle
 			}
 			(PenToolFsmState::DraggingHandle, PenToolMessage::DragStop) => {
 				tool_data.should_mirror = true;
-				tool_data.finish_placing_handle(document, transform, responses).unwrap_or(PenToolFsmState::PlacingAnchor)
+				let state = tool_data.finish_placing_handle(document, transform, responses).unwrap_or(PenToolFsmState::PlacingAnchor);
+				responses.add(DocumentMessage::CommitTransaction);
+				state
 			}
 			(PenToolFsmState::DraggingHandle, PenToolMessage::PointerMove { snap_angle, break_handle, lock_angle }) => {
 				let modifiers = ModifierState {
@@ -656,13 +712,29 @@ impl Fsm for PenToolFsmState {
 					.place_anchor(document, transform, input.mouse.position, modifiers, responses)
 					.unwrap_or(PenToolFsmState::Ready)
 			}
-			(PenToolFsmState::DraggingHandle | PenToolFsmState::PlacingAnchor, PenToolMessage::Abort | PenToolMessage::Confirm) => {
+			(_, PenToolMessage::Undo) => {
+				info!("Undo");
+				tool_data.undo(self, document, responses).unwrap_or(self)
+			}
+			(PenToolFsmState::Ready | PenToolFsmState::PlacingAnchor, PenToolMessage::Abort) => {
+				info!("Abort");
+
+				tool_data.undo_transaction(self, document, responses).unwrap_or_else(|| {
+					tool_data.path = None;
+					tool_data.snap_manager.cleanup(responses);
+					shape_overlay.clear_all_overlays(responses);
+					PenToolFsmState::Ready
+				})
+			}
+			(PenToolFsmState::DraggingHandle | PenToolFsmState::PlacingAnchor, PenToolMessage::Confirm) => {
+				info!("Abort | Confirm");
 				// Abort or commit the transaction to the undo history
 				let message = tool_data.finish_transaction(self, document, responses).unwrap_or(DocumentMessage::AbortTransaction);
 				responses.add(message);
 
 				tool_data.path = None;
 				tool_data.snap_manager.cleanup(responses);
+				shape_overlay.clear_all_overlays(responses);
 
 				PenToolFsmState::Ready
 			}

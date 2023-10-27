@@ -221,6 +221,7 @@ pub fn default_mapping() -> Mapping {
 		entry!(KeyDown(Rmb); action_dispatch=PenToolMessage::Confirm),
 		entry!(KeyDown(Escape); action_dispatch=PenToolMessage::Confirm),
 		entry!(KeyDown(Enter); action_dispatch=PenToolMessage::Confirm),
+		entry!(KeyDown(KeyZ); modifiers=[Alt], action_dispatch=PenToolMessage::Undo),
 		//
 		// FreehandToolMessage
 		entry!(PointerMove; action_dispatch=FreehandToolMessage::PointerMove),
